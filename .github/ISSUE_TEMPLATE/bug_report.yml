@@ -1,0 +1,52 @@
+name: Bug Report
+description: Report a bug in Orchestra Gateway
+labels: ["bug"]
+body:
+  - type: textarea
+    id: description
+    attributes:
+      label: Description
+      description: A clear description of the bug
+      placeholder: What happened?
+    validations:
+      required: true
+
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to Reproduce
+      description: How to reproduce this behavior
+      placeholder: |
+        1. Send POST /mcp with payload...
+        2. Observe response...
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected Behavior
+      description: What you expected to happen
+
+  - type: dropdown
+    id: component
+    attributes:
+      label: Component
+      options:
+        - MCP Transport (JSON-RPC / SSE)
+        - Tunnels (WebSocket relay)
+        - Smart Actions
+        - Health API
+        - Auth / JWT
+        - Docker / Deployment
+        - Other
+
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment
+      description: Gateway version, Go version, OS, deployment method
+      placeholder: |
+        Gateway: v1.0.0
+        Go: 1.25
+        OS: Linux (Docker)

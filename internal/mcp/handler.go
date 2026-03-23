@@ -1,0 +1,256 @@
+package mcp
+
+import (
+	"bufio"
+	"encoding/json"
+	"fmt"
+	"strings"
+	"time"
+
+	"github.com/gofiber/fiber/v3"
+	"github.com/orchestra-mcp/gateway/internal/auth"
+	"github.com/orchestra-mcp/gateway/internal/config"
+	"github.com/orchestra-mcp/gateway/internal/mcptools"
+	"github.com/orchestra-mcp/gateway/internal/permissions"
+	"gorm.io/gorm"
+)
+
+// Handler implements MCP Streamable HTTP transport (MCP 2025-11-25).
+// POST /mcp  — request/response
+// GET  /mcp  — SSE stream for server-initiated messages
+type Handler struct {
+	db       *gorm.DB
+	cfg      *config.Config
+	perms    *permissions.Checker
+	sessions *SessionStore
+	registry *mcptools.Registry
+}
+
+// NewHandler creates a fully wired MCP handler.
+func NewHandler(db *gorm.DB, cfg *config.Config) *Handler {
+	perms := permissions.NewChecker(db)
+	registry := mcptools.NewRegistry(db, cfg, perms)
+	return &Handler{
+		db:       db,
+		cfg:      cfg,
+		perms:    perms,
+		sessions: NewSessionStore(),
+		registry: registry,
+	}
+}
+
+// HandlePost handles POST /mcp — the main MCP request/response endpoint.
+func (h *Handler) HandlePost(c fiber.Ctx) error {
+	// Resolve caller identity (0 = anonymous).
+	userID, rawToken := h.resolveUser(c)
+
+	// Parse request body.
+	var req Request
+	if err := json.Unmarshal(c.Body(), &req); err != nil {
+		return h.writeError(c, nil, CodeParseError, "parse error")
+	}
+
+	if req.JSONRPC != "2.0" {
+		return h.writeError(c, req.ID, CodeInvalidRequest, "jsonrpc must be 2.0")
+	}
+
+	// If auth wasn't resolved from headers/params, fall back to session identity.
+	// Claude.ai sends the token only on 'initialize'; subsequent requests carry Mcp-Session-Id.
+	if userID == 0 {
+		if sessionID := c.Get("Mcp-Session-Id"); sessionID != "" {
+			if s, ok := h.sessions.Get(sessionID); ok && s.UserID != 0 {
+				userID = s.UserID
+				rawToken = s.RawToken
+			}
+		}
+	}
+
+	// Route to method handler.
+	result, rpcErr := h.dispatch(req, userID, rawToken, c)
+	if rpcErr != nil {
+		return h.writeError(c, req.ID, rpcErr.Code, rpcErr.Message)
+	}
+
+	// Notifications (no ID) get 202 Accepted, no body.
+	if req.ID == nil {
+		c.Status(fiber.StatusAccepted)
+		return nil
+	}
+
+	resp := Response{
+		JSONRPC: "2.0",
+		ID:      req.ID,
+		Result:  result,
+	}
+	c.Set("Content-Type", "application/json")
+	return c.JSON(resp)
+}
+
+// HandleGet handles GET /mcp — SSE stream for server push.
+func (h *Handler) HandleGet(c fiber.Ctx) error {
+	sessionID := c.Get("Mcp-Session-Id")
+	if sessionID == "" {
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
+			"error": "Mcp-Session-Id header required for SSE stream",
+		})
+	}
+
+	s, ok := h.sessions.Get(sessionID)
+	if !ok {
+		return c.Status(fiber.StatusNotFound).JSON(fiber.Map{
+			"error": "session not found",
+		})
+	}
+
+	c.Set("Content-Type", "text/event-stream")
+	c.Set("Cache-Control", "no-cache")
+	c.Set("Connection", "keep-alive")
+	c.Set("X-Accel-Buffering", "no")
+
+	w := bufio.NewWriter(c.Response().BodyWriter())
+
+	// Send initial "connected" event.
+	fmt.Fprintf(w, "event: connected\ndata: {\"sessionId\":%q}\n\n", sessionID)
+	w.Flush()
+
+	ticker := time.NewTicker(30 * time.Second)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case data, ok := <-s.send:
+			if !ok {
+				return nil
+			}
+			fmt.Fprintf(w, "event: message\ndata: %s\n\n", data)
+			w.Flush()
+
+		case <-ticker.C:
+			fmt.Fprintf(w, ": ping\n\n")
+			w.Flush()
+
+		case <-s.Done():
+			return nil
+
+		case <-c.Context().Done():
+			h.sessions.Remove(sessionID)
+			return nil
+		}
+	}
+}
+
+// dispatch routes an RPC method to its handler.
+func (h *Handler) dispatch(req Request, userID uint, rawToken string, c fiber.Ctx) (interface{}, *RPCError) {
+	switch req.Method {
+	case "initialize":
+		return h.handleInitialize(req, userID, rawToken, c)
+	case "notifications/initialized":
+		return nil, nil
+	case "ping":
+		return map[string]interface{}{}, nil
+	case "tools/list":
+		return h.handleToolsList(userID)
+	case "tools/call":
+		return h.handleToolCall(req, userID, rawToken)
+	default:
+		return nil, &RPCError{
+			Code:    CodeMethodNotFound,
+			Message: fmt.Sprintf("method not found: %s", req.Method),
+		}
+	}
+}
+
+// handleInitialize responds to the MCP initialize handshake.
+func (h *Handler) handleInitialize(_ Request, userID uint, rawToken string, c fiber.Ctx) (interface{}, *RPCError) {
+	s := h.sessions.Create(userID, rawToken)
+	c.Set("Mcp-Session-Id", s.ID)
+
+	result := InitializeResult{
+		ProtocolVersion: ProtocolVersion,
+		Capabilities: ServerCapabilities{
+			Tools:   &ToolsCapability{ListChanged: false},
+			Logging: &struct{}{},
+		},
+		ServerInfo: ServerInfo{
+			Name:        "orchestra-cloud-mcp",
+			Version:     "1.0.0",
+			Title:       "Orchestra Cloud",
+			Description: "Personal Orchestra MCP — manage your profile, install Orchestra, browse the marketplace, and control agent permissions from the web.",
+			Icons: []Icon{
+				{
+					Src:      "https://orchestra-mcp.dev/logo.svg",
+					MimeType: "image/svg+xml",
+				},
+			},
+			WebsiteURL: "https://orchestra-mcp.dev",
+		},
+		SessionID: s.ID,
+	}
+	return result, nil
+}
+
+// handleToolsList returns the filtered tool list based on user permissions.
+func (h *Handler) handleToolsList(userID uint) (interface{}, *RPCError) {
+	defs := h.registry.List(userID)
+	return map[string]interface{}{
+		"tools": defs,
+	}, nil
+}
+
+// handleToolCall dispatches a tool call and returns its result.
+func (h *Handler) handleToolCall(req Request, userID uint, rawToken string) (interface{}, *RPCError) {
+	if req.Params == nil {
+		return nil, &RPCError{Code: CodeInvalidParams, Message: "params required"}
+	}
+
+	name, _ := req.Params["name"].(string)
+	if name == "" {
+		return nil, &RPCError{Code: CodeInvalidParams, Message: "params.name required"}
+	}
+
+	args, _ := req.Params["arguments"].(map[string]interface{})
+	result, err := h.registry.Call(name, args, userID, rawToken)
+	if err != nil {
+		return nil, &RPCError{Code: CodeInternalError, Message: err.Error()}
+	}
+
+	return result, nil
+}
+
+// resolveUser extracts the user ID from the Authorization header or ?token= query param.
+// Returns (0, "") for anonymous callers.
+func (h *Handler) resolveUser(c fiber.Ctx) (uint, string) {
+	// Prefer Authorization header.
+	token := c.Get("Authorization")
+	if token == "" {
+		// Fall back to ?token= query param (used when pasting URL into Claude Desktop connectors dialog).
+		token = c.Query("token")
+	}
+	token = strings.TrimPrefix(token, "Bearer ")
+	token = strings.TrimPrefix(token, "bearer ")
+	token = strings.TrimSpace(token)
+	if token == "" {
+		return 0, ""
+	}
+	userID, err := auth.ValidateToken(token, h.cfg, h.db)
+	if err != nil {
+		return 0, ""
+	}
+	return userID, token
+}
+
+// writeError writes a JSON-RPC error response.
+func (h *Handler) writeError(c fiber.Ctx, id interface{}, code int, message string) error {
+	resp := Response{
+		JSONRPC: "2.0",
+		ID:      id,
+		Error:   &RPCError{Code: code, Message: message},
+	}
+	status := fiber.StatusOK
+	if code == CodeParseError || code == CodeInvalidRequest {
+		status = fiber.StatusBadRequest
+	}
+	c.Set("Content-Type", "application/json")
+	c.Status(status)
+	return c.JSON(resp)
+}

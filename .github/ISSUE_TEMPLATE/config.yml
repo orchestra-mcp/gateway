@@ -1,0 +1,8 @@
+blank_issues_enabled: true
+contact_links:
+  - name: Documentation
+    url: https://github.com/orchestra-mcp/gateway#readme
+    about: Check the README for setup and configuration
+  - name: Discussions
+    url: https://github.com/orchestra-mcp/gateway/discussions
+    about: Ask questions or share ideas
